@@ -39,4 +39,12 @@ impl<P: AsRef<Path>> Cache<P> {
 
         Ok(())
     }
+
+    /// Add an entry only if not already present in the cache.
+    pub fn add_if_missing(&self, id: &str, description: &str) -> Result<(), Box<dyn Error>> {
+        if !self.content()?.contains(&id.to_string()) {
+            self.add(id, description)?;
+        }
+        Ok(())
+    }
 }

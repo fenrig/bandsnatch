@@ -16,7 +16,10 @@ use std::str;
 use std::sync::Arc;
 
 pub mod structs;
-use crate::api::structs::*;
+use crate::api::structs::{
+    DigitalItem, DownloadInfo, DownloadsMap, Item, ParsedCollectionItems, ParsedFanpageData,
+    ParsedItemsData, RawDownloadsMap,
+};
 use crate::cookies;
 use crate::util;
 
@@ -98,8 +101,9 @@ impl Api {
     }
 
     /// Filters the download map by optional artist or album filters.
+    /// Enriches the result with purchase timestamps from items.
     fn filter_download_map<'a>(
-        unfiltered: Option<DownloadsMap>,
+        unfiltered: Option<RawDownloadsMap>,
         items: &'a Vec<&'a Item>,
         album: Option<&String>,
         artist: Option<&String>,
@@ -113,7 +117,15 @@ impl Api {
                     .find(|v| &format!("{}{}", v.sale_item_type, v.sale_item_id) == id)
                     .filter(|item| artist.is_none_or(|v| item.band_name.eq_ignore_ascii_case(v)))
                     .filter(|item| album.is_none_or(|v| item.item_title.eq_ignore_ascii_case(v)))
-                    .map(|_| (id.clone(), url.clone()))
+                    .map(|item| {
+                        (
+                            id.clone(),
+                            DownloadInfo {
+                                url: url.clone(),
+                                purchased: item.purchased.clone(),
+                            },
+                        )
+                    })
             })
             .collect::<DownloadsMap>()
     }
@@ -235,27 +247,27 @@ impl Api {
         while more_available {
             trace!("More items to collect, looping...");
             // retries
-            let body = PostCollectionBody {
+            let request_body = PostCollectionBody {
                 fan_id: &data.fan_data.fan_id,
                 older_than_token: &last_token,
             };
-            let body = self
+            let response_body = self
                 .client
                 .post(&Self::bc_path(&format!(
                     "api/fancollection/1/{collection_name}"
                 )))
-                .json(&body)
+                .json(&request_body)
                 .send()?
                 .json::<ParsedCollectionItems>()?;
 
-            let items = body.items.iter().by_ref().collect::<Vec<_>>();
+            let items = response_body.items.iter().by_ref().collect::<Vec<_>>();
             let redownload_urls =
-                Self::filter_download_map(Some(body.redownload_urls), &items, album, artist);
+                Self::filter_download_map(Some(response_body.redownload_urls), &items, album, artist);
             trace!("Collected {} items", redownload_urls.len());
 
             collection.extend(redownload_urls);
-            more_available = body.more_available;
-            last_token = body.last_token;
+            more_available = response_body.more_available;
+            last_token = response_body.last_token;
         }
 
         debug!("Finished paginating results for {collection_name}");

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use clap::{builder::PossibleValuesParser, Args as ClapArgs};
 use crossbeam_utils::thread;
 use indicatif::MultiProgress;
@@ -20,6 +21,28 @@ const FORMATS: &[&str] = &[
     "alac",
 ];
 
+/// Parse Bandcamp's purchase date format (e.g., "30 Jan 2026 02:51:12 GMT").
+fn parse_purchased_date(s: &str) -> Option<DateTime<Utc>> {
+    const FORMAT: &str = "%d %b %Y %T %Z";
+    chrono::NaiveDateTime::parse_from_str(s, FORMAT)
+        .ok()
+        .map(|dt| dt.and_utc())
+}
+
+/// Check if an item was purchased before the --after filter date.
+fn is_before_filter(after: Option<DateTime<Utc>>, purchased: Option<&String>) -> Option<DateTime<Utc>> {
+    let after_date = after?;
+    let purchased_date = parse_purchased_date(purchased?)?;
+    (purchased_date < after_date).then_some(purchased_date)
+}
+
+/// Parse a date string in YYYY-MM-DD format into a UTC DateTime.
+fn parse_date(s: &str) -> Result<DateTime<Utc>, String> {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map(|date| date.and_hms_opt(0, 0, 0).unwrap().and_utc())
+        .map_err(|_| format!("Invalid date '{}'. Use YYYY-MM-DD format.", s))
+}
+
 macro_rules! skip_err {
     ($res:expr) => {
         match $res {
@@ -34,6 +57,11 @@ macro_rules! skip_err {
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
+    /// Only download releases purchased after this date (YYYY-MM-DD).
+    /// Earlier releases will still be added to the cache.
+    #[arg(long, env = "BS_AFTER", value_parser = parse_date)]
+    after: Option<DateTime<Utc>>,
+
     #[arg(long, env = "BS_ALBUM")]
     album: Option<String>,
 
@@ -146,11 +174,21 @@ pub fn command(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
             // somehow re-create thread if it panics
             scope.spawn(move |_| {
-                while let Some((id, url)) = queue.get_work() {
+                while let Some((id, info)) = queue.get_work() {
                     m.suspend(|| debug!("thread {i} taking {id}"));
 
+                    // If purchased before the --after filter date, add to cache but skip download.
+                    if let Some(purchased_date) = is_before_filter(args.after, info.purchased.as_ref()) {
+                        m.suspend(|| debug!(
+                            "Skipping {id} (purchased {}), older than --after date",
+                            purchased_date.format("%Y-%m-%d")
+                        ));
+                        skip_err!(cache.lock().unwrap().add_if_missing(&id, "Skipped (--after filter)"));
+                        continue;
+                    }
+
                     // skip_err!
-                    let item = match api.get_digital_item(&url, &args.debug) {
+                    let item = match api.get_digital_item(&info.url, &args.debug) {
                         Ok(Some(item)) => item,
                         Ok(None) => {
                             let cache = cache.lock().unwrap();
@@ -194,18 +232,10 @@ pub fn command(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     // TODO: retries
                     skip_err!(api.download_item(&item, &path, &audio_format, &m));
 
-                    let cache = cache.lock().unwrap();
-                    if !cache.content().unwrap().contains(&id) {
-                        skip_err!(cache.add(
-                            &id,
-                            &format!(
-                                "{} ({}) by {}",
-                                item.title,
-                                item.release_year(),
-                                item.artist
-                            )
-                        ));
-                    }
+                    skip_err!(cache.lock().unwrap().add_if_missing(
+                        &id,
+                        &format!("{} ({}) by {}", item.title, item.release_year(), item.artist)
+                    ));
                 }
             });
         }

@@ -5,7 +5,19 @@ use std::collections::HashMap;
 pub mod digital_item;
 pub use crate::api::structs::digital_item::DigitalItem;
 
-pub type DownloadsMap = HashMap<String, String>;
+/// Download URL with optional purchase date
+#[derive(Clone, Debug)]
+pub struct DownloadInfo {
+    pub url: String,
+    /// Date string of when the item was purchased (e.g., "30 Jan 2026 02:51:12 GMT")
+    pub purchased: Option<String>,
+}
+
+/// Map of item ID to download info (URL + purchase date)
+pub type DownloadsMap = HashMap<String, DownloadInfo>;
+
+/// Raw URL map as returned from Bandcamp API (before enriching with purchase dates)
+pub type RawDownloadsMap = HashMap<String, String>;
 
 // TODO: test with no hidden items, some hidden items, and no non-hidden items.
 /// Structure of the JSON blob extracted from a user's Bandcamp page.
@@ -40,6 +52,8 @@ pub struct Item {
     pub band_name: String,
     /// The name of the item.
     pub item_title: String,
+    /// Date string of when the item was purchased (e.g., "30 Jan 2026 02:51:12 GMT").
+    pub purchased: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -54,7 +68,7 @@ pub struct CollectionData {
     pub batch_size: Option<u16>,
     pub item_count: Option<u16>,
     pub last_token: Option<String>,
-    pub redownload_urls: Option<DownloadsMap>,
+    pub redownload_urls: Option<RawDownloadsMap>,
 }
 
 /// Structure of the data returned from Bandcamp's collection API.
@@ -62,7 +76,7 @@ pub struct CollectionData {
 pub struct ParsedCollectionItems {
     pub more_available: bool,
     pub last_token: String,
-    pub redownload_urls: DownloadsMap,
+    pub redownload_urls: RawDownloadsMap,
     pub items: Vec<Item>,
 }
 
