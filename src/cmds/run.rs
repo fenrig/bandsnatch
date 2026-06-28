@@ -3,14 +3,14 @@ use crossbeam_utils::thread;
 use indicatif::MultiProgress;
 use std::{
     fs, io,
-    path::Path,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
 use crate::{
     api,
     cache::{self, CacheEntry},
-    cookies, util,
+    cookies, storage, util,
 };
 
 const FORMATS: &[&str] = &[
@@ -67,6 +67,10 @@ pub struct Args {
     #[arg(short, long, default_value_t = 4, env = "BS_JOBS")]
     jobs: u8,
 
+    /// The amount of parallel S3 upload jobs (threads) to use.
+    #[arg(long = "upload-jobs", default_value_t = 4, env = "BS_UPLOAD_JOBS")]
+    upload_jobs: u8,
+
     /// Maximum number of releases to download. Useful for testing.
     #[arg(short = 'n', long, env = "BS_LIMIT")]
     limit: Option<usize>,
@@ -80,6 +84,26 @@ pub struct Args {
         env = "BS_OUTPUT_FOLDER"
     )]
     output_folder: String,
+
+    /// S3 endpoint URL to use when `--output-folder` points at S3.
+    #[arg(long, env = "BS_S3_ENDPOINT")]
+    s3_endpoint: Option<String>,
+
+    /// S3 region used for signing requests.
+    #[arg(long, env = "BS_S3_REGION")]
+    s3_region: Option<String>,
+
+    /// S3 access key id.
+    #[arg(long, env = "BS_S3_ACCESS_KEY_ID")]
+    s3_access_key_id: Option<String>,
+
+    /// S3 secret access key.
+    #[arg(long, env = "BS_S3_SECRET_ACCESS_KEY")]
+    s3_secret_access_key: Option<String>,
+
+    /// Optional S3 session token.
+    #[arg(long, env = "BS_S3_SESSION_TOKEN")]
+    s3_session_token: Option<String>,
 
     /// Only download releases sold through this Bandcamp subdomain, e.g. a label's.
     #[arg(long, env = "BS_SUBDOMAIN")]
@@ -102,6 +126,12 @@ pub fn command(
         jobs,
         limit,
         output_folder,
+        upload_jobs,
+        s3_endpoint,
+        s3_region,
+        s3_access_key_id,
+        s3_secret_access_key,
+        s3_session_token,
         subdomain,
         user,
     }: Args,
@@ -110,23 +140,22 @@ pub fn command(
         let expanded = shellexpand::tilde(&p);
         expanded.into_owned()
     });
-    let root = shellexpand::tilde(&output_folder);
-    let root = Path::new(root.as_ref());
+    let root = PathBuf::from(shellexpand::tilde(&output_folder).into_owned());
     let limit = limit.unwrap_or(usize::MAX);
 
-    let root_exists = match fs::metadata(root) {
-        Ok(d) => Some(d.is_dir()),
-        Err(_) => None,
+    let s3_config = storage::S3Config {
+        endpoint: s3_endpoint,
+        region: s3_region,
+        access_key_id: s3_access_key_id,
+        secret_access_key: s3_secret_access_key,
+        session_token: s3_session_token,
+        upload_jobs: upload_jobs.max(1) as usize,
     };
+    let output_target = Arc::new(storage::OutputTarget::parse(&output_folder, s3_config)?);
+    output_target.ensure_ready()?;
 
-    match root_exists {
-        Some(true) => (),
-        Some(false) => {
-            error!("Cannot use `output-folder`, as it is not a folder. Please delete it and create as a directory, or try a different path.");
-            std::process::exit(1);
-        }
-        None => fs::create_dir_all(root)?,
-    }
+    let cache_path = storage::OutputTarget::cache_path_for_output_folder(&output_folder)?;
+    output_target.sync_cache_from_remote(&cache_path)?;
 
     let cookies = cookies::get_bandcamp_cookies(cookies_file.as_deref())?;
     let api = Arc::new(api::Api::new(cookies));
@@ -138,9 +167,7 @@ pub fn command(
             user
         }
     };
-    let cache = Arc::new(Mutex::new(cache::Cache::new(
-        root.join("bandcamp-collection-downloader.cache"),
-    )));
+    let cache = Arc::new(Mutex::new(cache::Cache::new(cache_path.clone())));
 
     let filters = api::structs::Filters {
         album: album.as_ref(),
@@ -181,6 +208,7 @@ pub fn command(
         for i in 0..jobs {
             let api = api.clone();
             let cache = cache.clone();
+            let output_target = output_target.clone();
             let m = m.clone();
             let queue = queue.clone();
             let audio_format = audio_format.clone();
@@ -236,12 +264,47 @@ pub fn command(
                     ))
                     .unwrap();
 
-                    let path = item.destination_path(root, &id);
-                    skip_err!(fs::create_dir_all(&path));
+                    let (path, release_key, staging_dir): (
+                        PathBuf,
+                        Option<String>,
+                        Option<PathBuf>,
+                    ) = match output_target.as_ref() {
+                        storage::OutputTarget::Local { root } => {
+                            let path = PathBuf::from(item.destination_path(root, &id));
+                            skip_err!(fs::create_dir_all(&path));
+                            (path, None, None)
+                        }
+                        storage::OutputTarget::S3(target) => {
+                            let path = skip_err!(storage::make_temp_release_dir(&id));
+                            let release_key = PathBuf::from(item.destination_path("", &id))
+                                .to_string_lossy()
+                                .replace('\\', "/");
+                            let release_key = if target.prefix.is_empty() {
+                                release_key
+                            } else {
+                                format!("{}/{}", target.prefix, release_key)
+                            };
+                            (path.clone(), Some(release_key), Some(path))
+                        }
+                    };
 
                     // TODO: separate cache for failed downloads.
                     // TODO: retries
                     skip_err!(api.download_item(&item, &path, &audio_format, &m));
+
+                    if let Some(key) = release_key.as_ref() {
+                        if let Err(e) = output_target.upload_release_dir(&path, key) {
+                            warn!("An error: {}; skipped.", e);
+                            if let Some(dir) = &staging_dir {
+                                let _ = fs::remove_dir_all(dir);
+                            }
+                            continue;
+                        }
+                    }
+
+                    if let Some(dir) = &staging_dir {
+                        let _ = fs::remove_dir_all(dir);
+                    }
 
                     let mut cache = skip_err!(cache
                         .lock()
@@ -261,6 +324,10 @@ pub fn command(
         }
     })
     .unwrap();
+
+    if !dry_run && cache_path.exists() {
+        output_target.sync_cache_to_remote(&cache_path)?;
+    }
 
     if dry_run {
         let results = dry_run_results

@@ -94,6 +94,22 @@ downloads remain skipped; if you use `--force`, the new download goes into an
 ID-suffixed folder instead of overwriting the old one. Check the new download
 before removing or moving any old folder.
 
+An S3 bucket can be used as the output target with `s3://bucket/prefix`.
+Finished releases and the cache are uploaded to the bucket while a local
+temporary working copy is used during the run:
+
+```
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=eu-west-1
+bandsnatch run -f flac -o s3://my-music-bucket/bandcamp
+```
+
+For S3-compatible services, set `--s3-endpoint` or `BS_S3_ENDPOINT`. Signing
+region and credentials can be overridden with the corresponding `--s3-*`
+options. Download and upload concurrency are controlled separately with
+`--jobs` and `--upload-jobs`.
+
 If an earlier run merged same-named releases, use `--force --album "<title>"`
 and `--artist "<artist>"` with your usual arguments to re-download them into
 separate folders.
