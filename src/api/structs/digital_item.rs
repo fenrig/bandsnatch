@@ -2,7 +2,10 @@ use crate::util::make_string_fs_safe;
 
 use chrono::{Datelike, NaiveDateTime};
 use serde::{self, Deserialize};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 const FORMAT: &str = "%d %b %Y %T %Z";
 
@@ -52,22 +55,35 @@ impl DigitalItem {
                 Err(err) => {
                     debug!("Failed to parse date time: {}", err);
                     String::from("0000")
-                },
+                }
             },
             None => String::from("0000"),
         }
     }
 
-    pub fn destination_path<P: AsRef<Path>>(&self, root: P) -> String {
-        root.as_ref()
-            .join(make_string_fs_safe(&self.artist))
-            .join(format!(
-                "{} ({})",
-                make_string_fs_safe(&self.title),
-                self.release_year()
-            ))
-            .to_str()
-            .unwrap()
-            .to_owned()
+    pub fn destination_path<P: AsRef<Path>>(&self, root: P) -> PathBuf {
+        root.as_ref().join(self.destination_relative_path())
+    }
+
+    pub fn destination_relative_path(&self) -> PathBuf {
+        PathBuf::from(make_string_fs_safe(&self.artist)).join(format!(
+            "{} ({})",
+            make_string_fs_safe(&self.title),
+            self.release_year()
+        ))
+    }
+
+    pub fn destination_key(&self, prefix: &str) -> String {
+        let relative = self
+            .destination_relative_path()
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let prefix = prefix.trim_matches('/');
+        if prefix.is_empty() {
+            relative
+        } else {
+            format!("{prefix}/{relative}")
+        }
     }
 }

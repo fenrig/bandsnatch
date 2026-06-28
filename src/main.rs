@@ -2,6 +2,7 @@ mod api;
 mod cache;
 mod cmds;
 mod cookies;
+mod storage;
 mod util;
 
 #[macro_use]

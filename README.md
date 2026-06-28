@@ -48,9 +48,20 @@ Options:
       --debug                   Enables some extra debug output in certain scenarios [env: BS_DEBUG=]
   -d, --dry-run                 Return a list of all tracks to be downloaded, without actually downloading them
   -F, --force                   Ignores any found cache file and instead does a from-scratch download run [env: BS_FORCE=]
-  -j, --jobs <JOBS>             The amount of parallel jobs (threads) to use [env: BS_JOBS=] [default: 4]
+  -j, --download-jobs <DOWNLOAD_JOBS>
+                                The amount of parallel download jobs (threads) to use [env: BS_DOWNLOAD_JOBS=] [default: 4]
+      --upload-jobs <UPLOAD_JOBS>
+                                The amount of parallel S3 upload jobs (threads) to use [env: BS_UPLOAD_JOBS=] [default: 4]
   -n, --limit <LIMIT>           Maximum number of releases to download. Useful for testing [env: BS_LIMIT=]
-  -o, --output-folder <FOLDER>  The folder to extract downloaded releases to [env: BS_OUTPUT_FOLDER=] [default: ./]
+  -o, --output-folder <FOLDER>  The folder to extract downloaded releases to, or an `s3://bucket/prefix` target [env: BS_OUTPUT_FOLDER=] [default: ./]
+      --s3-endpoint <S3_ENDPOINT>   S3 endpoint URL for custom object stores [env: BS_S3_ENDPOINT=]
+      --s3-region <S3_REGION>       S3 region used for signing [env: BS_S3_REGION=]
+      --s3-access-key-id <S3_ACCESS_KEY_ID>
+                                   S3 access key id [env: BS_S3_ACCESS_KEY_ID=]
+      --s3-secret-access-key <S3_SECRET_ACCESS_KEY>
+                                   S3 secret access key [env: BS_S3_SECRET_ACCESS_KEY=]
+      --s3-session-token <S3_SESSION_TOKEN>
+                                   Optional S3 session token [env: BS_S3_SESSION_TOKEN=]
   -h, --help                    Print help information
 ```
 
@@ -69,6 +80,24 @@ This would download my entire music collection into a local "Music" folder, and
 also create a `bandcamp-collection-downloader.cache` in the same directory,
 which then gets read on future runs in order to skip items it has already
 retrieved.
+
+If you point `--output-folder` at S3 instead, Bandsnatch uploads each finished
+release directly to the bucket and stores the cache in the bucket too, under
+`bandcamp-collection-downloader.cache` within the configured prefix. Bandsnatch
+still keeps a local working copy while it runs.
+
+```
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+bandsnatch run -f flac -o s3://my-music-bucket/bandcamp ovyerus
+```
+
+For S3-compatible services, set `--s3-endpoint` or `BS_S3_ENDPOINT` to the
+service endpoint. You can also override the signing region and credentials with
+the corresponding `--s3-*` flags if you do not want to rely on AWS environment
+variables. Download and upload concurrency are controlled separately with
+`--download-jobs` and `--upload-jobs`.
 
 ## Authentication
 

@@ -1,14 +1,13 @@
-use chrono::{DateTime, Utc};
 use clap::{builder::PossibleValuesParser, Args as ClapArgs};
 use crossbeam_utils::thread;
 use indicatif::MultiProgress;
 use std::{
     fs,
-    path::Path,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-use crate::{api, cache, cookies, util};
+use crate::{api, cache, cookies, storage, util};
 
 const FORMATS: &[&str] = &[
     "flac",
@@ -21,26 +20,22 @@ const FORMATS: &[&str] = &[
     "alac",
 ];
 
-/// Parse Bandcamp's purchase date format (e.g., "30 Jan 2026 02:51:12 GMT").
-fn parse_purchased_date(s: &str) -> Option<DateTime<Utc>> {
-    const FORMAT: &str = "%d %b %Y %T %Z";
-    chrono::NaiveDateTime::parse_from_str(s, FORMAT)
-        .ok()
-        .map(|dt| dt.and_utc())
-}
-
-/// Check if an item was purchased before the --after filter date.
-fn is_before_filter(after: Option<DateTime<Utc>>, purchased: Option<&String>) -> Option<DateTime<Utc>> {
-    let after_date = after?;
-    let purchased_date = parse_purchased_date(purchased?)?;
-    (purchased_date < after_date).then_some(purchased_date)
-}
-
-/// Parse a date string in YYYY-MM-DD format into a UTC DateTime.
-fn parse_date(s: &str) -> Result<DateTime<Utc>, String> {
-    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map(|date| date.and_hms_opt(0, 0, 0).unwrap().and_utc())
-        .map_err(|_| format!("Invalid date '{}'. Use YYYY-MM-DD format.", s))
+fn add_cache_entry(
+    cache: &Arc<Mutex<cache::Cache<PathBuf>>>,
+    cache_dirty: &Arc<Mutex<bool>>,
+    id: &str,
+    description: &str,
+) {
+    let added = match cache.lock().unwrap().add_if_missing(id, description) {
+        Ok(added) => added,
+        Err(e) => {
+            warn!("An error: {}; skipped.", e);
+            return;
+        }
+    };
+    if added {
+        *cache_dirty.lock().unwrap() = true;
+    }
 }
 
 macro_rules! skip_err {
@@ -57,11 +52,6 @@ macro_rules! skip_err {
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
-    /// Only download releases purchased after this date (YYYY-MM-DD).
-    /// Earlier releases will still be added to the cache.
-    #[arg(long, env = "BS_AFTER", value_parser = parse_date)]
-    after: Option<DateTime<Utc>>,
-
     #[arg(long, env = "BS_ALBUM")]
     album: Option<String>,
 
@@ -87,9 +77,19 @@ pub struct Args {
     #[arg(short = 'F', long, env = "BS_FORCE")]
     force: bool,
 
-    /// The amount of parallel jobs (threads) to use.
-    #[arg(short, long, default_value_t = 4, env = "BS_JOBS")]
-    jobs: u8,
+    /// The amount of parallel download jobs (threads) to use.
+    #[arg(
+        short = 'j',
+        long = "download-jobs",
+        alias = "jobs",
+        default_value_t = 4,
+        env = "BS_DOWNLOAD_JOBS"
+    )]
+    download_jobs: u8,
+
+    /// The amount of parallel S3 upload jobs (threads) to use.
+    #[arg(long = "upload-jobs", default_value_t = 4, env = "BS_UPLOAD_JOBS")]
+    upload_jobs: u8,
 
     /// Maximum number of releases to download. Useful for testing.
     #[arg(short = 'n', long, env = "BS_LIMIT")]
@@ -105,42 +105,80 @@ pub struct Args {
     )]
     output_folder: String,
 
+    /// S3 endpoint URL to use when `--output-folder` points at S3.
+    #[arg(long, env = "BS_S3_ENDPOINT")]
+    s3_endpoint: Option<String>,
+
+    /// S3 region used for signing requests.
+    #[arg(long, env = "BS_S3_REGION")]
+    s3_region: Option<String>,
+
+    /// S3 access key id.
+    #[arg(long, env = "BS_S3_ACCESS_KEY_ID")]
+    s3_access_key_id: Option<String>,
+
+    /// S3 secret access key.
+    #[arg(long, env = "BS_S3_SECRET_ACCESS_KEY")]
+    s3_secret_access_key: Option<String>,
+
+    /// Optional S3 session token.
+    #[arg(long, env = "BS_S3_SESSION_TOKEN")]
+    s3_session_token: Option<String>,
+
     /// Name of the user to download releases from (must be logged in through cookies).
     #[clap(env = "BS_USER")]
     user: String,
 }
 
 pub fn command(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let cookies_file = args.cookies.map(|p| {
+    let Args {
+        album,
+        artist,
+        audio_format,
+        cookies,
+        debug,
+        dry_run,
+        force,
+        download_jobs,
+        limit,
+        output_folder,
+        upload_jobs,
+        s3_endpoint,
+        s3_region,
+        s3_access_key_id,
+        s3_secret_access_key,
+        s3_session_token,
+        user,
+    } = args;
+
+    let cookies_file = cookies.map(|p| {
         let expanded = shellexpand::tilde(&p);
         expanded.into_owned()
     });
-    let root = shellexpand::tilde(&args.output_folder);
-    let root = Path::new(root.as_ref());
-    let limit = args.limit.unwrap_or(usize::MAX);
+    let download_jobs = download_jobs.max(1);
+    let upload_jobs = upload_jobs.max(1);
 
-    let root_exists = match fs::metadata(root) {
-        Ok(d) => Some(d.is_dir()),
-        Err(_) => None,
+    let s3_config = storage::S3Config {
+        endpoint: s3_endpoint,
+        region: s3_region,
+        access_key_id: s3_access_key_id,
+        secret_access_key: s3_secret_access_key,
+        session_token: s3_session_token,
+        upload_jobs: upload_jobs as usize,
     };
+    let output_target = Arc::new(storage::OutputTarget::parse(&output_folder, s3_config)?);
+    output_target.ensure_ready()?;
 
-    match root_exists {
-        Some(true) => (),
-        Some(false) => {
-            error!("Cannot use `output-folder`, as it is not a folder. Please delete it and create as a directory, or try a different path.");
-            std::process::exit(1);
-        }
-        None => fs::create_dir_all(root)?,
-    }
+    let cache_path = storage::OutputTarget::cache_path_for_output_folder(&output_folder)?;
+    output_target.sync_cache_from_remote(&cache_path)?;
+    let cache = Arc::new(Mutex::new(cache::Cache::new(cache_path.clone())));
+    let cache_dirty = Arc::new(Mutex::new(false));
 
     let cookies = cookies::get_bandcamp_cookies(cookies_file.as_deref())?;
     let api = Arc::new(api::Api::new(cookies));
-    let cache = Arc::new(Mutex::new(cache::Cache::new(
-        root.join("bandcamp-collection-downloader.cache"),
-    )));
 
     let download_urls = api
-        .get_download_urls(&args.user, args.artist.as_ref(), args.album.as_ref())?
+        .get_download_urls(&user, artist.as_ref(), album.as_ref())?
         .download_urls;
     let items = {
         // Lock gets freed after this block.
@@ -148,12 +186,22 @@ pub fn command(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         download_urls
             .into_iter()
-            .filter(|(x, _)| args.force || !cache_content.contains(x))
-            .take(limit)
+            .filter(|(x, _)| force || !cache_content.contains(x))
+            .take(limit.unwrap_or(usize::MAX))
             .collect::<Vec<_>>()
     };
 
-    if args.dry_run {
+    if items.is_empty() {
+        if dry_run {
+            println!("Fetching information for 0 found releases");
+        } else {
+            println!("Trying to download 0 releases");
+        }
+        println!("Finished!");
+        return Ok(());
+    }
+
+    if dry_run {
         println!("Fetching information for {} found releases", items.len());
     } else {
         println!("Trying to download {} releases", items.len());
@@ -164,49 +212,37 @@ pub fn command(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let dry_run_results = Arc::new(Mutex::new(Vec::<String>::new()));
 
     thread::scope(|scope| {
-        for i in 0..args.jobs {
+        for i in 0..download_jobs {
             let api = api.clone();
             let cache = cache.clone();
+            let output_target = output_target.clone();
             let m = m.clone();
             let queue = queue.clone();
-            let audio_format = args.audio_format.clone();
+            let audio_format = audio_format.clone();
             let dry_run_results = dry_run_results.clone();
+            let cache_dirty = cache_dirty.clone();
 
             // somehow re-create thread if it panics
             scope.spawn(move |_| {
                 while let Some((id, info)) = queue.get_work() {
                     m.suspend(|| debug!("thread {i} taking {id}"));
 
-                    // If purchased before the --after filter date, add to cache but skip download.
-                    if let Some(purchased_date) = is_before_filter(args.after, info.purchased.as_ref()) {
-                        m.suspend(|| debug!(
-                            "Skipping {id} (purchased {}), older than --after date",
-                            purchased_date.format("%Y-%m-%d")
-                        ));
-                        skip_err!(cache.lock().unwrap().add_if_missing(&id, "Skipped (--after filter)"));
-                        continue;
-                    }
-
                     // skip_err!
-                    let item = match api.get_digital_item(&info.url, &args.debug) {
+                    let item = match api.get_digital_item(&info.url, &debug) {
                         Ok(Some(item)) => item,
                         Ok(None) => {
-                            let cache = cache.lock().unwrap();
                             warn!("Could not find digital item for {id}");
-                            skip_err!(cache.add(&id, "UNKNOWN"));
                             continue;
                         }
                         Err(_) => continue,
                     };
 
                     if let None = item.downloads {
-                        let cache = cache.lock().unwrap();
-                        warn!("Skipping {id}, does not have any downloads");
-                        skip_err!(cache.add(&id, "No downloads"));
+                        warn!("No downloads available for {id}; nothing to download.");
                         continue;
                     }
 
-                    if args.dry_run {
+                    if dry_run {
                         let results_lock = dry_run_results.lock();
                         if let Ok(mut results) = results_lock {
                             results.push(format!("{id}, {} - {}", item.title, item.artist))
@@ -225,22 +261,71 @@ pub fn command(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     ))
                     .unwrap();
 
-                    let path = item.destination_path(root);
-                    skip_err!(fs::create_dir_all(&path));
+                    let (path, release_key, staging_dir): (
+                        PathBuf,
+                        Option<String>,
+                        Option<PathBuf>,
+                    ) = match output_target.as_ref() {
+                        storage::OutputTarget::Local { root } => {
+                            let path = item.destination_path(root);
+                            skip_err!(fs::create_dir_all(&path));
+                            (path, None, None)
+                        }
+                        storage::OutputTarget::S3(target) => {
+                            let path = skip_err!(storage::make_temp_release_dir(&id));
+                            (
+                                path.clone(),
+                                Some(item.destination_key(&target.prefix)),
+                                Some(path),
+                            )
+                        }
+                    };
 
                     // TODO: separate cache for failed downloads.
                     // TODO: retries
-                    skip_err!(api.download_item(&item, &path, &audio_format, &m));
+                    if let Err(e) = api.download_item(&item, &path, &audio_format, &m) {
+                        warn!("An error: {}; skipped.", e);
+                        if let Some(dir) = &staging_dir {
+                            let _ = fs::remove_dir_all(dir);
+                        }
+                        continue;
+                    }
 
-                    skip_err!(cache.lock().unwrap().add_if_missing(
+                    if let Some(key) = release_key.as_ref() {
+                        if let Err(e) = output_target.upload_release_dir(&path, key) {
+                            warn!("An error: {}; skipped.", e);
+                            if let Some(dir) = &staging_dir {
+                                let _ = fs::remove_dir_all(dir);
+                            }
+                            continue;
+                        }
+                    }
+
+                    if let Some(dir) = &staging_dir {
+                        let _ = fs::remove_dir_all(dir);
+                    }
+
+                    add_cache_entry(
+                        &cache,
+                        &cache_dirty,
                         &id,
-                        &format!("{} ({}) by {}", item.title, item.release_year(), item.artist)
-                    ));
+                        &format!(
+                            "{} ({}) by {}",
+                            item.title,
+                            item.release_year(),
+                            item.artist
+                        ),
+                    );
                 }
             });
         }
     })
     .unwrap();
+
+    if *cache_dirty.lock().unwrap() {
+        debug!("Uploading updated cache to storage backend");
+        output_target.sync_cache_to_remote(cache_path.as_path())?;
+    }
 
     if args.dry_run {
         println!("{}", dry_run_results.lock().unwrap().join("\n"));

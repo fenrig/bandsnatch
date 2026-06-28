@@ -117,15 +117,7 @@ impl Api {
                     .find(|v| &format!("{}{}", v.sale_item_type, v.sale_item_id) == id)
                     .filter(|item| artist.is_none_or(|v| item.band_name.eq_ignore_ascii_case(v)))
                     .filter(|item| album.is_none_or(|v| item.item_title.eq_ignore_ascii_case(v)))
-                    .map(|item| {
-                        (
-                            id.clone(),
-                            DownloadInfo {
-                                url: url.clone(),
-                                purchased: item.purchased.clone(),
-                            },
-                        )
-                    })
+                    .map(|_| (id.clone(), DownloadInfo { url: url.clone() }))
             })
             .collect::<DownloadsMap>()
     }
@@ -261,8 +253,12 @@ impl Api {
                 .json::<ParsedCollectionItems>()?;
 
             let items = response_body.items.iter().by_ref().collect::<Vec<_>>();
-            let redownload_urls =
-                Self::filter_download_map(Some(response_body.redownload_urls), &items, album, artist);
+            let redownload_urls = Self::filter_download_map(
+                Some(response_body.redownload_urls),
+                &items,
+                album,
+                artist,
+            );
             trace!("Collected {} items", redownload_urls.len());
 
             collection.extend(redownload_urls);
@@ -317,7 +313,7 @@ impl Api {
     pub fn download_item(
         &self,
         item: &DigitalItem,
-        path: &str,
+        path: &Path,
         audio_format: &str,
         m: &indicatif::MultiProgress,
     ) -> Result<(), Box<dyn Error>> {
@@ -363,11 +359,11 @@ impl Api {
             9,
         )
         .trim_matches('"');
-        m.suspend(|| debug!("Downloading as `{filename}` to `{path}`"));
+        m.suspend(|| debug!("Downloading as `{filename}` to `{}`", path.display()));
 
         // TODO: drop file with `.part` extension instead, while downloading, and then rename when finished?.
 
-        let full_path = Path::new(path).join(filename);
+        let full_path = path.join(filename);
         let mut file = File::create(&full_path)?;
         let mut stream = res;
         m.suspend(|| debug!("Starting download"));

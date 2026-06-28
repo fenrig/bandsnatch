@@ -5,15 +5,13 @@ use std::collections::HashMap;
 pub mod digital_item;
 pub use crate::api::structs::digital_item::DigitalItem;
 
-/// Download URL with optional purchase date
+/// Download URL
 #[derive(Clone, Debug)]
 pub struct DownloadInfo {
     pub url: String,
-    /// Date string of when the item was purchased (e.g., "30 Jan 2026 02:51:12 GMT")
-    pub purchased: Option<String>,
 }
 
-/// Map of item ID to download info (URL + purchase date)
+/// Map of item ID to download info (URL)
 pub type DownloadsMap = HashMap<String, DownloadInfo>;
 
 /// Raw URL map as returned from Bandcamp API (before enriching with purchase dates)
@@ -52,8 +50,6 @@ pub struct Item {
     pub band_name: String,
     /// The name of the item.
     pub item_title: String,
-    /// Date string of when the item was purchased (e.g., "30 Jan 2026 02:51:12 GMT").
-    pub purchased: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
