@@ -64,7 +64,13 @@ pub struct Args {
     force: bool,
 
     /// The amount of parallel jobs (threads) to use.
-    #[arg(short, long, default_value_t = 4, env = "BS_JOBS")]
+    #[arg(
+        short = 'j',
+        long = "download-jobs",
+        alias = "jobs",
+        default_value_t = 4,
+        env = "BS_DOWNLOAD_JOBS"
+    )]
     jobs: u8,
 
     /// The amount of parallel S3 upload jobs (threads) to use.
@@ -140,7 +146,6 @@ pub fn command(
         let expanded = shellexpand::tilde(&p);
         expanded.into_owned()
     });
-    let root = PathBuf::from(shellexpand::tilde(&output_folder).into_owned());
     let limit = limit.unwrap_or(usize::MAX);
 
     let s3_config = storage::S3Config {

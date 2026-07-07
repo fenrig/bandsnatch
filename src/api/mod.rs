@@ -1,3 +1,4 @@
+use ::reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, REFERER};
 use ::reqwest::IntoUrl;
 use governor::{Quota, RateLimiter};
 use http::header::CONTENT_DISPOSITION;
@@ -48,7 +49,20 @@ pub struct Api {
 impl Api {
     pub fn new(cookies: Vec<cookies::RawCookie>) -> Self {
         let cookie_jar = cookies::fill_cookie_jar(cookies);
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
+            ACCEPT,
+            HeaderValue::from_static(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            ),
+        );
+        default_headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+        default_headers.insert(REFERER, HeaderValue::from_static("https://bandcamp.com/"));
         let client = reqwest::ClientBuilder::new()
+            .user_agent(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+            )
+            .default_headers(default_headers)
             .cookie_provider(Arc::new(cookie_jar))
             .build()
             .unwrap();
@@ -139,6 +153,57 @@ impl Api {
         }
     }
 
+    fn html_title(body: &str) -> Option<String> {
+        let lower = body.to_lowercase();
+        let start = lower.find("<title>")?;
+        let end = lower[start + 7..].find("</title>")?;
+        Some(body[start + 7..start + 7 + end].trim().to_string())
+    }
+
+    fn html_preview(body: &str, limit: usize) -> String {
+        body.chars()
+            .take(limit)
+            .collect::<String>()
+            .replace(['\n', '\r', '\t'], " ")
+    }
+
+    fn guess_page_kind(body: &str) -> &'static str {
+        let lower = body.to_lowercase();
+        if lower.contains("attention required") || lower.contains("cloudflare") {
+            "looks like a block or challenge page"
+        } else if lower.contains("log in")
+            || lower.contains("sign in")
+            || lower.contains("password")
+        {
+            "looks like a login page"
+        } else if lower.contains("page not found") || lower.contains("not found") {
+            "looks like a missing-page response"
+        } else {
+            "looks like a generic page without `#pagedata`"
+        }
+    }
+
+    pub(crate) fn extract_pagedata_blob(
+        body: &str,
+        context: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        let soup = Soup::new(body);
+        let title = Self::html_title(body).unwrap_or_else(|| String::from("<missing title>"));
+        let data_el = soup.attr("id", "pagedata").find().ok_or_else(|| {
+            format!(
+                "failed to find `#pagedata` while parsing {context}; title={title:?}; {}; preview={:?}",
+                Self::guess_page_kind(body),
+                Self::html_preview(body, 240)
+            )
+        })?;
+        Ok(data_el.get("data-blob").ok_or_else(|| {
+            simple_error::SimpleError::new(format!(
+                "failed to find `data-blob` on `#pagedata` while parsing {context}; title={title:?}; preview={:?}",
+                Self::html_preview(body, 240)
+            ))
+        })?.to_string())
+    }
+
     /// Filters the download map down to downloadable items matching `filters`.
     fn filter_download_map(
         unfiltered: Option<DownloadsMap>,
@@ -175,17 +240,11 @@ impl Api {
         debug!("`get_download_urls` for Bandcamp page '{name}'");
 
         let body = self.request(Method::GET, &Self::bc_path(name))?.text()?;
-        let soup = Soup::new(&body);
-
-        let data_el = soup
-            .attr("id", "pagedata")
-            .find()
-            .expect("Failed to extract data from collection page.");
-        let data_blob = data_el
-            .get("data-blob")
-            .expect("Failed to extract data from element on collection page.");
-        let mut fanpage_data: ParsedFanpageData = serde_json::from_str(&data_blob)
-            .expect("Failed to deserialise collection page data blob.");
+        let data_blob = Self::extract_pagedata_blob(&body, &format!("Bandcamp page `{name}`"))?;
+        let mut fanpage_data: ParsedFanpageData =
+            serde_json::from_str(&data_blob).map_err(|e| {
+                format!("failed to deserialize collection page data blob for `{name}`: {e}")
+            })?;
         debug!("Successfully fetched Bandcamp page, and found + deserialised data blob");
 
         let items = fanpage_data
@@ -306,35 +365,32 @@ impl Api {
     ) -> Result<Option<DigitalItem>, Box<dyn Error>> {
         debug!("Retrieving digital item information for {url}");
         let text = self.request(Method::GET, url)?.text()?;
-        let soup = Soup::new(&text);
+        let download_page_blob =
+            match Self::extract_pagedata_blob(&text, &format!("digital item `{url}`")) {
+                Ok(blob) => blob,
+                Err(e) => {
+                    println!("Failed to get item info for {url}.");
+                    if *debug {
+                        println!("\n{text}\n");
+                    } else {
+                        println!("Run with `--debug` to see the full HTML page.\n");
+                    }
+                    return Err(e);
+                }
+            };
 
-        let download_page_blob = soup
-            .attr("id", "pagedata")
-            .find()
-            .expect(&format!(
-                "could not find `pagedata` element for digital item {url}"
-            ))
-            .get("data-blob")
-            .expect(&format!(
-                "could not extract `data-blob` from the pagedata element for digital item {url}"
-            ));
-
-        let item_result = std::panic::catch_unwind(|| {
-            serde_json::from_str::<ParsedItemsData>(&download_page_blob).unwrap()
-        });
-
-        if item_result.is_err() {
-            println!("Failed to get item info for {url}.");
-            if *debug {
-                println!("\n{download_page_blob}\n");
-            } else {
-                println!("Run with `--debug` to see the full JSON blob.\n")
+        let item = match serde_json::from_str::<ParsedItemsData>(&download_page_blob) {
+            Ok(item) => item.digital_items.first().cloned(),
+            Err(e) => {
+                println!("Failed to get item info for {url}.");
+                if *debug {
+                    println!("\n{download_page_blob}\n");
+                } else {
+                    println!("Run with `--debug` to see the full JSON blob.\n")
+                }
+                bail!("failed parsing {url}: {e}");
             }
-
-            bail!(format!("failed parsing {url}"));
-        }
-
-        let item = item_result.unwrap().digital_items.first().cloned();
+        };
 
         Ok(item)
     }
@@ -342,7 +398,7 @@ impl Api {
     pub fn download_item(
         &self,
         item: &DigitalItem,
-        path: &str,
+        path: &Path,
         audio_format: &str,
         m: &indicatif::MultiProgress,
     ) -> Result<(), Box<dyn Error>> {
@@ -388,11 +444,11 @@ impl Api {
             9,
         )
         .trim_matches('"');
-        m.suspend(|| debug!("Downloading as `{filename}` to `{path}`"));
+        m.suspend(|| debug!("Downloading as `{filename}` to `{}`", path.display()));
 
         // TODO: drop file with `.part` extension instead, while downloading, and then rename when finished?.
 
-        let full_path = Path::new(path).join(filename);
+        let full_path = path.join(filename);
         let mut file = File::create(&full_path)?;
         let mut stream = res;
         m.suspend(|| debug!("Starting download"));

@@ -15,6 +15,8 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread::sleep,
+    time::Duration,
 };
 use url::Url;
 
@@ -75,6 +77,8 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'}')
     .add(b'<')
     .add(b'>');
+
+const MAX_S3_RETRIES: usize = 3;
 
 impl OutputTarget {
     pub fn parse(output_folder: &str, s3_config: S3Config) -> Result<Self, Box<dyn Error>> {
@@ -175,12 +179,12 @@ impl S3Target {
             .to_string();
         let prefix = url.path().trim_matches('/').to_string();
 
-        let endpoint = Self::endpoint_url(config.endpoint.as_deref())?;
         let region = config
             .region
             .or_else(|| Self::env_or("AWS_REGION", "BS_S3_REGION"))
             .or_else(|| env::var("AWS_DEFAULT_REGION").ok())
             .unwrap_or_else(|| "us-east-1".to_string());
+        let endpoint = Self::endpoint_url(config.endpoint.as_deref(), &region)?;
         let access_key = config
             .access_key_id
             .or_else(|| Self::env_or("AWS_ACCESS_KEY_ID", "BS_S3_ACCESS_KEY_ID"))
@@ -213,7 +217,7 @@ impl S3Target {
         env::var(primary).ok().or_else(|| env::var(fallback).ok())
     }
 
-    fn endpoint_url(endpoint: Option<&str>) -> Result<Url, Box<dyn Error>> {
+    fn endpoint_url(endpoint: Option<&str>, region: &str) -> Result<Url, Box<dyn Error>> {
         if let Some(endpoint) = endpoint
             .map(str::to_string)
             .or_else(|| Self::env_or("AWS_ENDPOINT_URL", "BS_S3_ENDPOINT"))
@@ -222,8 +226,6 @@ impl S3Target {
             return Ok(Url::parse(&endpoint)?);
         }
 
-        let region = Self::env_or("AWS_REGION", "AWS_DEFAULT_REGION")
-            .unwrap_or_else(|| "us-east-1".to_string());
         let endpoint = if region == "us-east-1" {
             "https://s3.amazonaws.com".to_string()
         } else {
@@ -401,19 +403,45 @@ impl S3Target {
         file.read_to_end(&mut bytes)?;
 
         let payload_hash = Self::sha256_hex(&bytes);
-        let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let headers = self.auth_headers("PUT", &request_path, &host, &payload_hash, &amz_date);
+        for attempt in 0..=MAX_S3_RETRIES {
+            let amz_date = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let headers = self.auth_headers("PUT", &request_path, &host, &payload_hash, &amz_date);
 
-        let response = self.client.put(url).headers(headers).body(bytes).send()?;
+            match self
+                .client
+                .put(url.clone())
+                .headers(headers)
+                .body(bytes.clone())
+                .send()
+            {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) if response.status().is_server_error() && attempt < MAX_S3_RETRIES => {
+                    warn!(
+                        "S3 upload for `{key}` returned {}; retrying ({}/{})",
+                        response.status(),
+                        attempt + 1,
+                        MAX_S3_RETRIES
+                    );
+                }
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.text().unwrap_or_default();
+                    bail!("S3 upload failed for `{key}` with status {status}: {body}");
+                }
+                Err(error) if attempt < MAX_S3_RETRIES => {
+                    warn!(
+                        "S3 upload for `{key}` failed: {error}; retrying ({}/{})",
+                        attempt + 1,
+                        MAX_S3_RETRIES
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
 
-        if !response.status().is_success() {
-            bail!(
-                "S3 upload failed for `{key}` with status {}",
-                response.status()
-            );
+            sleep(Duration::from_secs(1 << attempt));
         }
 
-        Ok(())
+        unreachable!("S3 retry loop must return or fail")
     }
 
     fn download_cache(&self, local_path: &Path) -> Result<(), Box<dyn Error>> {
@@ -547,6 +575,74 @@ impl S3Target {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{S3Config, S3Target};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    #[test]
+    fn default_endpoint_uses_configured_region() {
+        assert_eq!(
+            S3Target::endpoint_url(None, "eu-west-1").unwrap().as_str(),
+            "https://s3.eu-west-1.amazonaws.com/"
+        );
+    }
+
+    #[test]
+    fn explicit_endpoint_is_not_replaced() {
+        assert_eq!(
+            S3Target::endpoint_url(Some("https://objects.example.test"), "eu-west-1")
+                .unwrap()
+                .as_str(),
+            "https://objects.example.test/"
+        );
+    }
+
+    #[test]
+    fn upload_uses_path_style_s3_request_and_sigv4() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let size = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            let request_lower = request.to_ascii_lowercase();
+            assert!(request.starts_with("PUT /bucket/music/track.flac HTTP/1.1"));
+            assert!(request_lower.contains("authorization: aws4-hmac-sha256"));
+            assert!(request_lower.contains("x-amz-content-sha256:"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+
+        let file =
+            std::env::temp_dir().join(format!("bandsnatch-s3-test-{}", rand::random::<u64>()));
+        fs::write(&file, b"test payload").unwrap();
+
+        let target = S3Target::new(
+            "s3://bucket/music",
+            S3Config {
+                endpoint: Some(format!("http://{address}")),
+                region: Some("test-region".to_string()),
+                access_key_id: Some("test-access-key".to_string()),
+                secret_access_key: Some("test-secret-key".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        target.put_file(&file, "music/track.flac").unwrap();
+
+        fs::remove_file(file).unwrap();
+        server.join().unwrap();
     }
 }
 

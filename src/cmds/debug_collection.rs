@@ -1,7 +1,6 @@
 use crate::cookies;
 use clap::Args as ClapArgs;
 use serde_json::json;
-use soup::prelude::*;
 use std::fs::File;
 use std::io::Write;
 
@@ -48,17 +47,12 @@ pub fn command(
         .get(&format!("https://bandcamp.com/{user}"))
         .send()?
         .text()?;
-    let soup = Soup::new(&body);
+    let data_blob = crate::api::Api::extract_pagedata_blob(
+        &body,
+        &format!("collection page for `{user}`"),
+    )?;
 
-    let data_el = soup
-        .attr("id", "pagedata")
-        .find()
-        .expect("Failed to find `pagedata` element on your collection page.");
-    let data_blob = data_el
-        .get("data-blob")
-        .expect("Failed to extract data from element on collection page.");
-
-    let mut jason: serde_json::value::Value = serde_json::from_str(&data_blob).unwrap();
+    let mut jason: serde_json::value::Value = serde_json::from_str(&data_blob)?;
     // Clear out info that we dont want shared
     jason["collection_data"]["redownload_urls"] = json!("[redacted by bandsnatch]");
     jason["collection_data"]["sequence"] = json!("[redacted by bandsnatch]");
