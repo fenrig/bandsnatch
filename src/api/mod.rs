@@ -122,21 +122,65 @@ impl Api {
             .collect::<DownloadsMap>()
     }
 
-    fn download_fanpage_data(&self, name: &str) -> Result<ParsedFanpageData, Box<dyn Error>> {
-        debug!("`download_fanpage_data` for Bandcamp page '{name}'");
+    fn html_title(body: &str) -> Option<String> {
+        let lower = body.to_lowercase();
+        let start = lower.find("<title>")?;
+        let end = lower[start + 7..].find("</title>")?;
+        Some(body[start + 7..start + 7 + end].trim().to_string())
+    }
 
-        let body = self.request(Method::GET, &Self::bc_path(name))?.text()?;
-        let soup = Soup::new(&body);
+    fn html_preview(body: &str, limit: usize) -> String {
+        body.chars().take(limit).collect::<String>().replace(['\n', '\r', '\t'], " ")
+    }
+
+    fn guess_page_kind(body: &str) -> &'static str {
+        let lower = body.to_lowercase();
+        if lower.contains("attention required") || lower.contains("cloudflare") {
+            "looks like a block or challenge page"
+        } else if lower.contains("log in") || lower.contains("sign in") || lower.contains("password") {
+            "looks like a login page"
+        } else if lower.contains("page not found") || lower.contains("not found") {
+            "looks like a missing-page response"
+        } else {
+            "looks like a generic page without `#pagedata`"
+        }
+    }
+
+    pub(crate) fn extract_pagedata_blob(
+        body: &str,
+        context: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        let soup = Soup::new(body);
+        let title = Self::html_title(body).unwrap_or_else(|| String::from("<missing title>"));
 
         let data_el = soup
             .attr("id", "pagedata")
             .find()
-            .expect("Failed to extract data from collection page.");
-        let data_blob = data_el
-            .get("data-blob")
-            .expect("Failed to extract data from element on collection page.");
-        let fanpage_data: ParsedFanpageData = serde_json::from_str(&data_blob)
-            .expect("Failed to deserialise collection page data blob.");
+            .ok_or_else(|| {
+                format!(
+                    "failed to find `#pagedata` while parsing {context}; title={title:?}; {}; preview={:?}",
+                    Self::guess_page_kind(body),
+                    Self::html_preview(body, 240)
+                )
+            })?;
+        let data_blob = data_el.get("data-blob").ok_or_else(|| {
+            format!(
+                "failed to find `data-blob` on `#pagedata` while parsing {context}; title={title:?}; preview={:?}",
+                Self::html_preview(body, 240)
+            )
+        })?;
+
+        Ok(data_blob)
+    }
+
+    fn download_fanpage_data(&self, name: &str) -> Result<ParsedFanpageData, Box<dyn Error>> {
+        debug!("`download_fanpage_data` for Bandcamp page '{name}'");
+
+        let body = self.request(Method::GET, &Self::bc_path(name))?.text()?;
+        let data_blob = Self::extract_pagedata_blob(&body, &format!("Bandcamp page `{name}`"))?;
+        let fanpage_data: ParsedFanpageData = serde_json::from_str(&data_blob).map_err(|e| {
+            format!("failed to deserialize collection page data blob for `{name}`: {e}")
+        })?;
         debug!("Successfully fetched Bandcamp page, and found + deserialised data blob");
 
         Ok(fanpage_data)
@@ -277,35 +321,33 @@ impl Api {
     ) -> Result<Option<DigitalItem>, Box<dyn Error>> {
         debug!("Retrieving digital item information for {url}");
         let text = self.request(Method::GET, url)?.text()?;
-        let soup = Soup::new(&text);
+        let download_page_blob = match Self::extract_pagedata_blob(&text, &format!("digital item `{url}`")) {
+            Ok(blob) => blob,
+            Err(e) => {
+                println!("Failed to get item info for {url}.");
+                if *debug {
+                    println!("\n{text}\n");
+                } else {
+                    println!("Run with `--debug` to see the full HTML page.\n");
+                }
 
-        let download_page_blob = soup
-            .attr("id", "pagedata")
-            .find()
-            .expect(&format!(
-                "could not find `pagedata` element for digital item {url}"
-            ))
-            .get("data-blob")
-            .expect(&format!(
-                "could not extract `data-blob` from the pagedata element for digital item {url}"
-            ));
-
-        let item_result = std::panic::catch_unwind(|| {
-            serde_json::from_str::<ParsedItemsData>(&download_page_blob).unwrap()
-        });
-
-        if item_result.is_err() {
-            println!("Failed to get item info for {url}.");
-            if *debug {
-                println!("\n{download_page_blob}\n");
-            } else {
-                println!("Run with `--debug` to see the full JSON blob.\n")
+                return Err(e);
             }
+        };
 
-            bail!(format!("failed parsing {url}"))
-        }
+        let item = match serde_json::from_str::<ParsedItemsData>(&download_page_blob) {
+            Ok(item) => item.digital_items.first().cloned(),
+            Err(e) => {
+                println!("Failed to get item info for {url}.");
+                if *debug {
+                    println!("\n{download_page_blob}\n");
+                } else {
+                    println!("Run with `--debug` to see the full JSON blob.\n");
+                }
 
-        let item = item_result.unwrap().digital_items.first().cloned();
+                bail!("failed parsing {url}: {e}");
+            }
+        };
 
         Ok(item)
     }
