@@ -25,6 +25,44 @@ pub enum OutputTarget {
     S3(S3Target),
 }
 
+/// A temporary release directory that is removed when it goes out of scope.
+/// This keeps cleanup reliable across download and upload failures.
+pub struct TempReleaseDir {
+    path: PathBuf,
+}
+
+pub struct TempReleaseCleanup;
+
+impl TempReleaseCleanup {
+    pub fn new() -> Self {
+        cleanup_temp_release_dirs();
+        Self
+    }
+}
+
+impl Drop for TempReleaseCleanup {
+    fn drop(&mut self) {
+        cleanup_temp_release_dirs();
+    }
+}
+
+impl TempReleaseDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempReleaseDir {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            debug!(
+                "Could not remove temporary directory `{}`: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct S3Config {
     pub endpoint: Option<String>,
@@ -646,7 +684,7 @@ mod tests {
     }
 }
 
-pub fn make_temp_release_dir(release_id: &str) -> Result<PathBuf, Box<dyn Error>> {
+pub fn make_temp_release_dir(release_id: &str) -> Result<TempReleaseDir, Box<dyn Error>> {
     let mut path = std::env::temp_dir();
     let suffix: u64 = rand::random();
     path.push(format!(
@@ -654,5 +692,33 @@ pub fn make_temp_release_dir(release_id: &str) -> Result<PathBuf, Box<dyn Error>
         make_string_fs_safe(release_id)
     ));
     fs::create_dir_all(&path)?;
-    Ok(path)
+    Ok(TempReleaseDir { path })
+}
+
+/// Remove temporary release directories left behind by an interrupted run.
+pub fn cleanup_temp_release_dirs() {
+    let entries = match fs::read_dir(env::temp_dir()) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!("Could not inspect the temporary directory for cleanup: {error}");
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_bandsnatch_dir = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("bandsnatch-") && path.is_dir());
+
+        if is_bandsnatch_dir {
+            if let Err(error) = fs::remove_dir_all(&path) {
+                warn!(
+                    "Could not remove temporary directory `{}`: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
 }

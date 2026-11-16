@@ -142,6 +142,8 @@ pub fn command(
         user,
     }: Args,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _temp_cleanup = storage::TempReleaseCleanup::new();
+
     let cookies_file = cookies.map(|p| {
         let expanded = shellexpand::tilde(&p);
         expanded.into_owned()
@@ -269,10 +271,10 @@ pub fn command(
                     ))
                     .unwrap();
 
-                    let (path, release_key, staging_dir): (
+                    let (path, release_key, _staging_dir): (
                         PathBuf,
                         Option<String>,
-                        Option<PathBuf>,
+                        Option<storage::TempReleaseDir>,
                     ) = match output_target.as_ref() {
                         storage::OutputTarget::Local { root } => {
                             let path = PathBuf::from(item.destination_path(root, &id));
@@ -280,7 +282,8 @@ pub fn command(
                             (path, None, None)
                         }
                         storage::OutputTarget::S3(target) => {
-                            let path = skip_err!(storage::make_temp_release_dir(&id));
+                            let _staging_dir = skip_err!(storage::make_temp_release_dir(&id));
+                            let path = _staging_dir.path().to_path_buf();
                             let release_key = PathBuf::from(item.destination_path("", &id))
                                 .to_string_lossy()
                                 .replace('\\', "/");
@@ -289,26 +292,22 @@ pub fn command(
                             } else {
                                 format!("{}/{}", target.prefix, release_key)
                             };
-                            (path.clone(), Some(release_key), Some(path))
+                            (path, Some(release_key), Some(_staging_dir))
                         }
                     };
 
                     // TODO: separate cache for failed downloads.
                     // TODO: retries
-                    skip_err!(api.download_item(&item, &path, &audio_format, &m));
+                    if let Err(e) = api.download_item(&item, &path, &audio_format, &m) {
+                        warn!("An error: {}; skipped.", e);
+                        continue;
+                    }
 
                     if let Some(key) = release_key.as_ref() {
                         if let Err(e) = output_target.upload_release_dir(&path, key) {
                             warn!("An error: {}; skipped.", e);
-                            if let Some(dir) = &staging_dir {
-                                let _ = fs::remove_dir_all(dir);
-                            }
                             continue;
                         }
-                    }
-
-                    if let Some(dir) = &staging_dir {
-                        let _ = fs::remove_dir_all(dir);
                     }
 
                     let mut cache = skip_err!(cache
