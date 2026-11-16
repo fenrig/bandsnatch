@@ -12,7 +12,7 @@ use std::{
     env,
     error::Error,
     fs,
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread::sleep,
@@ -685,14 +685,45 @@ mod tests {
 }
 
 pub fn make_temp_release_dir(release_id: &str) -> Result<TempReleaseDir, Box<dyn Error>> {
+    // A previous interrupted run may have left enough data behind to prevent
+    // the next staging directory from being created.
+    cleanup_temp_release_dirs();
+
     let mut path = std::env::temp_dir();
     let suffix: u64 = rand::random();
     path.push(format!(
         "bandsnatch-{}-{suffix}",
         make_string_fs_safe(release_id)
     ));
-    fs::create_dir_all(&path)?;
+    fs::create_dir_all(&path).map_err(|error| {
+        if error.kind() == io::ErrorKind::StorageFull {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not create temporary release directory `{}`: temporary storage is full; free space in `{}` and retry",
+                    path.display(),
+                    std::env::temp_dir().display()
+                ),
+            )
+        } else {
+            error
+        }
+    })?;
     Ok(TempReleaseDir { path })
+}
+
+pub fn is_storage_full(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::StorageFull)
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 /// Remove temporary release directories left behind by an interrupted run.

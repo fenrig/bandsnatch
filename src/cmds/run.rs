@@ -299,7 +299,14 @@ pub fn command(
                     // TODO: separate cache for failed downloads.
                     // TODO: retries
                     if let Err(e) = api.download_item(&item, &path, &audio_format, &m) {
-                        warn!("An error: {}; skipped.", e);
+                        if storage::is_storage_full(e.as_ref()) {
+                            warn!(
+                                "Download skipped because temporary storage is full; free space in `{}` and retry.",
+                                std::env::temp_dir().display()
+                            );
+                        } else {
+                            warn!("An error: {}; skipped.", e);
+                        }
                         continue;
                     }
 
