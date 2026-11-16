@@ -11,6 +11,7 @@ use std::{
     collections::VecDeque,
     env,
     error::Error,
+    ffi::CString,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -117,6 +118,7 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'>');
 
 const MAX_S3_RETRIES: usize = 3;
+const MIN_TEMP_FREE_BYTES: u64 = 512 * 1024 * 1024;
 
 impl OutputTarget {
     pub fn parse(output_folder: &str, s3_config: S3Config) -> Result<Self, Box<dyn Error>> {
@@ -685,9 +687,7 @@ mod tests {
 }
 
 pub fn make_temp_release_dir(release_id: &str) -> Result<TempReleaseDir, Box<dyn Error>> {
-    // A previous interrupted run may have left enough data behind to prevent
-    // the next staging directory from being created.
-    cleanup_temp_release_dirs();
+    wait_for_temp_space();
 
     let mut path = std::env::temp_dir();
     let suffix: u64 = rand::random();
@@ -710,6 +710,61 @@ pub fn make_temp_release_dir(release_id: &str) -> Result<TempReleaseDir, Box<dyn
         }
     })?;
     Ok(TempReleaseDir { path })
+}
+
+fn wait_for_temp_space() {
+    #[cfg(unix)]
+    {
+        let temp_dir = env::temp_dir();
+        let Some(path) = temp_dir.to_str() else {
+            return;
+        };
+        let Ok(path) = CString::new(path) else {
+            return;
+        };
+
+        let Some(available) = available_temp_space(&path) else {
+            return;
+        };
+        if available >= MIN_TEMP_FREE_BYTES || !has_temp_release_dirs() {
+            return;
+        }
+
+        warn!("Temporary storage is low ({available} bytes free); waiting for an upload to finish");
+        while has_temp_release_dirs() {
+            sleep(Duration::from_secs(1));
+            let Some(available) = available_temp_space(&path) else {
+                return;
+            };
+            if available >= MIN_TEMP_FREE_BYTES {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn available_temp_space(path: &CString) -> Option<u64> {
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    Some(stats.f_bavail as u64 * stats.f_frsize as u64)
+}
+
+fn has_temp_release_dirs() -> bool {
+    fs::read_dir(env::temp_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("bandsnatch-") && entry.path().is_dir())
+        })
 }
 
 pub fn is_storage_full(error: &(dyn Error + 'static)) -> bool {

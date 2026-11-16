@@ -119,6 +119,7 @@ dependencies = [
  "hmac",
  "http",
  "indicatif",
+ "libc",
  "log",
  "nonzero_ext",
  "percent-encoding",
