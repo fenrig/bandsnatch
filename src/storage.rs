@@ -15,9 +15,12 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use url::Url;
 
@@ -33,6 +36,21 @@ pub struct TempReleaseDir {
 }
 
 pub struct TempReleaseCleanup;
+
+#[derive(Clone, Default)]
+pub struct TempSpaceState {
+    stop_downloads: Arc<AtomicBool>,
+}
+
+impl TempSpaceState {
+    pub fn should_stop_downloads(&self) -> bool {
+        self.stop_downloads.load(Ordering::Relaxed)
+    }
+
+    fn stop_downloads(&self) {
+        self.stop_downloads.store(true, Ordering::Relaxed);
+    }
+}
 
 impl TempReleaseCleanup {
     pub fn new() -> Self {
@@ -118,7 +136,8 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'>');
 
 const MAX_S3_RETRIES: usize = 3;
-const MIN_TEMP_FREE_BYTES: u64 = 512 * 1024 * 1024;
+const TEMP_USAGE_LIMIT_PERCENT: u64 = 60;
+const TEMP_SPACE_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 impl OutputTarget {
     pub fn parse(output_folder: &str, s3_config: S3Config) -> Result<Self, Box<dyn Error>> {
@@ -686,8 +705,17 @@ mod tests {
     }
 }
 
-pub fn make_temp_release_dir(release_id: &str) -> Result<TempReleaseDir, Box<dyn Error>> {
-    wait_for_temp_space();
+pub fn make_temp_release_dir(
+    release_id: &str,
+    temp_space: &TempSpaceState,
+) -> Result<TempReleaseDir, Box<dyn Error>> {
+    if !wait_for_temp_space(temp_space) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "stopping downloads after waiting 15 minutes for temporary storage",
+        )
+        .into());
+    }
 
     let mut path = std::env::temp_dir();
     let suffix: u64 = rand::random();
@@ -712,34 +740,61 @@ pub fn make_temp_release_dir(release_id: &str) -> Result<TempReleaseDir, Box<dyn
     Ok(TempReleaseDir { path })
 }
 
-fn wait_for_temp_space() {
+fn wait_for_temp_space(temp_space: &TempSpaceState) -> bool {
     #[cfg(unix)]
     {
+        if temp_space.should_stop_downloads() {
+            return false;
+        }
+
         let temp_dir = env::temp_dir();
         let Some(path) = temp_dir.to_str() else {
-            return;
+            return true;
         };
         let Ok(path) = CString::new(path) else {
-            return;
+            return true;
         };
 
         let Some(available) = available_temp_space(&path) else {
-            return;
+            return true;
         };
-        if available >= MIN_TEMP_FREE_BYTES || !has_temp_release_dirs() {
-            return;
+        let Some(total) = total_temp_space(&path) else {
+            return true;
+        };
+        if available * 100 >= total * (100 - TEMP_USAGE_LIMIT_PERCENT) || !has_temp_release_dirs() {
+            return true;
         }
 
-        warn!("Temporary storage is low ({available} bytes free); waiting for an upload to finish");
+        warn!(
+            "Temporary storage is over {TEMP_USAGE_LIMIT_PERCENT}% full; waiting for an upload to finish"
+        );
+        let deadline = Instant::now() + TEMP_SPACE_WAIT_TIMEOUT;
         while has_temp_release_dirs() {
+            if temp_space.should_stop_downloads() || Instant::now() >= deadline {
+                temp_space.stop_downloads();
+                warn!(
+                    "Temporary storage did not recover within 15 minutes; stopping new downloads"
+                );
+                return false;
+            }
             sleep(Duration::from_secs(1));
             let Some(available) = available_temp_space(&path) else {
-                return;
+                return true;
             };
-            if available >= MIN_TEMP_FREE_BYTES {
-                return;
+            let Some(total) = total_temp_space(&path) else {
+                return true;
+            };
+            if available * 100 >= total * (100 - TEMP_USAGE_LIMIT_PERCENT) {
+                return true;
             }
         }
+        return true;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = temp_space;
+        true
     }
 }
 
@@ -752,6 +807,17 @@ fn available_temp_space(path: &CString) -> Option<u64> {
     }
     let stats = unsafe { stats.assume_init() };
     Some(stats.f_bavail as u64 * stats.f_frsize as u64)
+}
+
+#[cfg(unix)]
+fn total_temp_space(path: &CString) -> Option<u64> {
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    Some(stats.f_blocks as u64 * stats.f_frsize as u64)
 }
 
 fn has_temp_release_dirs() -> bool {

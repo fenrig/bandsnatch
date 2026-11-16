@@ -208,6 +208,7 @@ pub fn command(
     }
 
     let queue = util::WorkQueue::from_vec(items);
+    let temp_space = Arc::new(storage::TempSpaceState::default());
     let m = Arc::new(MultiProgress::new());
     let dry_run_results = Arc::new(Mutex::new(Vec::<String>::new()));
 
@@ -219,11 +220,15 @@ pub fn command(
             let m = m.clone();
             let queue = queue.clone();
             let audio_format = audio_format.clone();
+            let temp_space = temp_space.clone();
             let dry_run_results = dry_run_results.clone();
 
             // somehow re-create thread if it panics
             scope.spawn(move |_| {
                 while let Some((id, download)) = queue.get_work() {
+                    if temp_space.should_stop_downloads() {
+                        break;
+                    }
                     m.suspend(|| debug!("thread {i} taking {id}"));
                     let cache_entry = if download.is_preorder {
                         CacheEntry::Preorder
@@ -282,7 +287,10 @@ pub fn command(
                             (path, None, None)
                         }
                         storage::OutputTarget::S3(target) => {
-                            let _staging_dir = skip_err!(storage::make_temp_release_dir(&id));
+                            let _staging_dir = skip_err!(storage::make_temp_release_dir(
+                                &id,
+                                &temp_space
+                            ));
                             let path = _staging_dir.path().to_path_buf();
                             let release_key = PathBuf::from(item.destination_path("", &id))
                                 .to_string_lossy()
